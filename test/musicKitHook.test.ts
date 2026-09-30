@@ -512,7 +512,7 @@ describe("MusicKit queue context", () => {
     expect(musicKit.play).toHaveBeenCalledOnce();
   });
 
-  it("waits for Stop rewind before selecting an occurrence", async () => {
+  it.each(["goTo", "openUri"])("waits for Stop rewind before %s", async operation => {
     const current = item(0);
     const { window, musicKit, bridgeSend } = createHarness({ musicKitOverrides: {
       queue: { items: [current], position: 0 }, nowPlayingItem: current,
@@ -521,14 +521,20 @@ describe("MusicKit queue context", () => {
     musicKit.seekToTime.mockReturnValueOnce(new Promise<void>(resolve => { resolveSeek = resolve; }));
     const stopped = window.__sidra!.stop(1);
     await Promise.resolve();
-    const selected = window.__sidra!.goTo(latest(bridgeSend).currentOccurrenceId);
+    const selected = operation === "goTo"
+      ? window.__sidra!.goTo(latest(bridgeSend).currentOccurrenceId)
+      : window.__sidra!.openUri("https://music.apple.com/album/123");
     await new Promise<void>(resolve => setImmediate(resolve));
     expect(musicKit.seekToTime).toHaveBeenCalledOnce();
     expect(musicKit.play).not.toHaveBeenCalled();
+    expect(musicKit.setQueue).not.toHaveBeenCalled();
     resolveSeek();
     await Promise.all([stopped, selected]);
-    expect(musicKit.seekToTime).toHaveBeenCalledTimes(2);
-    expect(musicKit.play).toHaveBeenCalledOnce();
+    expect(bridgeSend).toHaveBeenCalledWith("playbackStopped", { requestId: 1, success: true }, 1);
+    if (operation === "goTo") {
+      expect(musicKit.seekToTime).toHaveBeenCalledTimes(2);
+      expect(musicKit.play).toHaveBeenCalledOnce();
+    } else expect(musicKit.setQueue).toHaveBeenCalledOnce();
   });
 
   it("does not play an occurrence removed during rewind", async () => {
@@ -754,6 +760,53 @@ describe("MusicKit queue command ordering", () => {
     expect(musicKit.play).not.toHaveBeenCalled();
     expect(musicKit.pause).toHaveBeenCalledOnce();
     expect(bridgeSend).toHaveBeenCalledWith("playbackStopped", { requestId: 1, success: true }, 1);
+  });
+
+  it.each(["goTo", "openUri"].flatMap(operation => [
+    [operation, "before SDK settlement"], [operation, "during the instance check"],
+  ] as const))("does not let waiting %s depend on a later Stop %s", async (operation, timing) => {
+    const items = [{ id: "song", attributes: { durationInMillis: 120_000 } }];
+    const { window, musicKit, bridgeSend } = createHarness({ musicKitOverrides: {
+      queue: { items, position: 0 }, nowPlayingItem: items[0],
+    } });
+    let resolveNext!: () => void;
+    musicKit.skipToNextItem.mockReturnValueOnce(new Promise<void>(resolve => { resolveNext = resolve; }));
+    const next = window.__sidra!.next();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    const snapshot = bridgeSend.mock.calls.find(([channel]) => channel === "queueDidChange")![1] as QueueSnapshot;
+    const queued = operation === "goTo"
+      ? window.__sidra!.goTo(snapshot.currentOccurrenceId)
+      : window.__sidra!.openUri("https://music.apple.com/album/123");
+    let stopCompleted = false;
+    const stop = () => {
+      Promise.resolve(window.__sidra!.stop(1)).then(() => { stopCompleted = true; });
+    };
+    if (timing === "before SDK settlement") stop();
+    else {
+      const instance = window.__sidraHookedMk;
+      let checked = false;
+      // Re-enter Stop after valid() has sampled the request token, so cancellation
+      // alone cannot protect the queue callback from awaiting its own successor.
+      Object.defineProperty(window, "__sidraHookedMk", { get() {
+        if (!checked) { checked = true; stop(); }
+        return instance;
+      } });
+    }
+    let queueCompleted = false;
+    const completed = Promise.all([next, queued]).then(() => { queueCompleted = true; });
+    resolveNext();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(queueCompleted).toBe(true);
+    expect(stopCompleted).toBe(true);
+    await completed;
+    expect(musicKit.setQueue).not.toHaveBeenCalled();
+    expect(musicKit.changeToMediaAtIndex).not.toHaveBeenCalled();
+    expect(musicKit.pause).toHaveBeenCalledOnce();
+    expect(musicKit.seekToTime).toHaveBeenCalledExactlyOnceWith(0);
+    expect(musicKit.play).not.toHaveBeenCalled();
+    expect(bridgeSend).toHaveBeenCalledWith("playbackStopped", { requestId: 1, success: true }, 1);
+    await window.__sidra!.play();
+    expect(musicKit.play).toHaveBeenCalledOnce();
   });
 
   it("waits for delayed GoTo arrival even after the SDK promise resolves", async () => {

@@ -644,13 +644,15 @@
         if (blockedQueue) throw new Error("Queue operation still pending");
         const request = ++queueRequest;
         const pageGeneration = documentGeneration;
+        // A later Stop is chained behind this work and must never be awaited here.
+        const afterStop = pendingStop;
         const valid = () => request === queueRequest &&
           pageGeneration === documentGeneration && documentActive &&
           window.__sidraHookedMk === mk;
         queueTask = queueTask
           .then(async () => {
             if (!valid()) return;
-            if (pendingStop) await pendingStop.task;
+            if (afterStop) await afterStop.task;
             if (!valid()) return;
             resetStop();
             await operation(valid);
