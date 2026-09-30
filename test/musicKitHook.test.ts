@@ -4,6 +4,7 @@ import vm from "node:vm";
 import { describe, expect, it, vi } from "vitest";
 import { Player } from "../src/player";
 import { allServices } from "../src/musicService";
+import type { QueueSnapshot } from "../src/queue";
 
 const hookScript = fs
   .readFileSync(
@@ -125,6 +126,7 @@ function createMusicKit(
     isPlaying: true,
     nowPlayingItem: undefined,
     pause: vi.fn(),
+    changeToMediaAtIndex: vi.fn<(index: number) => Promise<void>>(() => Promise.resolve()),
     play: vi.fn(),
     queue: { length: 1 },
     repeatMode: 0,
@@ -356,6 +358,258 @@ function createHarness({
     window,
   };
 }
+
+describe("MusicKit queue context", () => {
+  const item = (n: number) => ({ id: "duplicate-id", attributes: { name: `Track ${n}`, durationInMillis: 120_000 } });
+  function latest(bridgeSend: ReturnType<typeof vi.fn>): QueueSnapshot {
+    const calls = bridgeSend.mock.calls.filter(([channel]) => channel === "queueDidChange");
+    return calls.at(-1)![1] as QueueSnapshot;
+  }
+
+  it.each([
+    [0, 0, []], [8, 4, Array.from({ length: 8 }, (_, n) => n)],
+    [500, 0, Array.from({ length: 21 }, (_, n) => n)],
+    [500, 250, Array.from({ length: 21 }, (_, n) => n + 240)],
+    [500, 499, Array.from({ length: 21 }, (_, n) => n + 479)],
+  ])("bounds a queue of %i around occurrence %i", (length, position, expected) => {
+    const items = Array.from({ length }, (_, n) => item(n));
+    const { bridgeSend } = createHarness({ musicKitOverrides: { queue: { items, position }, nowPlayingItem: items[position] } });
+    expect(latest(bridgeSend).items.map(item => item.name)).toEqual(expected.map(n => `Track ${n}`));
+    const ids = latest(bridgeSend).items.map(item => item.occurrenceId);
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(latest(bridgeSend).currentOccurrenceId).toBe(length ? ids[expected.indexOf(position)] : null);
+    // The bounded payload passes the actual main-process validator.
+    const player = new Player();
+    player.handleQueueDidChange(latest(bridgeSend));
+    expect(player.queueSnapshot()).toEqual(latest(bridgeSend));
+  });
+
+  it("anchors a loaded queue with no current item at a clamped queue position", () => {
+    const items = Array.from({ length: 100 }, (_, n) => item(n));
+    const { bridgeSend } = createHarness({ musicKitOverrides: { queue: { items, position: 500 }, nowPlayingItem: null } });
+    expect(latest(bridgeSend).items[0].name).toBe("Track 79");
+    expect(latest(bridgeSend).currentOccurrenceId).toBeNull();
+  });
+
+  it("preserves identities across insertions, removals, moves and context slides", () => {
+    const items = Array.from({ length: 35 }, (_, n) => item(n));
+    const { musicKit, musicKitListeners, bridgeSend } = createHarness({
+      musicKitOverrides: { queue: { items, position: 10 }, nowPlayingItem: items[10] },
+    });
+    const identities = new Map(latest(bridgeSend).items.map(item => [item.name, item.occurrenceId]));
+    const retained = items[10];
+    items.unshift(item(99));
+    items.splice(3, 1);
+    items.splice(20, 0, items.splice(5, 1)[0]);
+    musicKitListeners.get("queueItemsDidChange")?.();
+    expect(latest(bridgeSend).items.find(item => item.name === "Track 10")?.occurrenceId).toBe(identities.get("Track 10"));
+    Object.assign(musicKit, { nowPlayingItem: items[29] });
+    musicKitListeners.get("nowPlayingItemDidChange")?.({ item: items[29] });
+    expect(latest(bridgeSend).items).toHaveLength(21);
+    Object.assign(musicKit, { nowPlayingItem: retained });
+    musicKitListeners.get("nowPlayingItemDidChange")?.({ item: retained });
+    expect(latest(bridgeSend).currentOccurrenceId).toBe(identities.get("Track 10"));
+  });
+
+  it("publishes metadata edits missed by queue events, without position tick traffic", () => {
+    const items = [item(0), item(1)];
+    const { bridgeSend, musicKitListeners, runVolumePoll } = createHarness({
+      musicKitOverrides: { queue: { items, position: 0 }, nowPlayingItem: items[0] },
+    });
+    bridgeSend.mockClear();
+    for (let n = 0; n < 20; n++) {
+      musicKitListeners.get("playbackTimeDidChange")?.();
+      runVolumePoll();
+    }
+    expect(bridgeSend.mock.calls.filter(([channel]) => channel === "queueDidChange")).toEqual([]);
+    items[1].attributes.name = "Corrected";
+    runVolumePoll();
+    expect(latest(bridgeSend).items[1].name).toBe("Corrected");
+    expect(bridgeSend.mock.calls.filter(([channel]) => channel === "queueDidChange")).toHaveLength(1);
+  });
+
+  it("resets occurrence IDs on MusicKit instance replacement and ignores stale events", () => {
+    const items = [item(0)];
+    const harness = createHarness({ musicKitOverrides: { queue: { items, position: 0 }, nowPlayingItem: items[0] } });
+    const before = latest(harness.bridgeSend).currentOccurrenceId;
+    harness.replaceInstance();
+    harness.runMonitorCycles(1);
+    expect(latest(harness.bridgeSend).currentOccurrenceId).not.toBe(before);
+    harness.bridgeSend.mockClear();
+    harness.musicKitListeners.get("queueItemsDidChange")?.();
+    expect(harness.bridgeSend).not.toHaveBeenCalled();
+  });
+
+  it("declines an ambiguous queue that reuses the same object twice", () => {
+    const same = item(0);
+    const { bridgeSend } = createHarness({ musicKitOverrides: {
+      queue: { items: [same, same], position: 0 }, nowPlayingItem: same,
+    } });
+    expect(latest(bridgeSend).items).toEqual([]);
+  });
+
+  it("contains queue-read failures without losing existing playback controls", async () => {
+    const current = item(0);
+    const queue = Object.defineProperty({}, "items", { get() { throw new Error("Queue unavailable"); } });
+    const { window, musicKit, bridgeSend } = createHarness({ musicKitOverrides: {
+      queue, nowPlayingItem: current,
+    } });
+    expect(latest(bridgeSend).items).toEqual([]);
+    await window.__sidra!.play();
+    expect(musicKit.play).toHaveBeenCalledOnce();
+    expect(bridgeSend).toHaveBeenCalledWith("hookReady", 1, 1);
+  });
+
+  it.each(["music.apple.com", "classical.music.apple.com"])("navigates an exact duplicate on %s and rewinds before play", async host => {
+    const items = [item(0), item(1)];
+    const { window, musicKit, musicKitListeners, bridgeSend } = createHarness({
+      musicKitOverrides: { queue: { items, position: 0 }, nowPlayingItem: items[0] },
+    });
+    Object.assign(window.location, { hostname: host, origin: `https://${host}` });
+    const selected = latest(bridgeSend).items[1].occurrenceId;
+    // Inserting at the front after publication must not redirect GoTo to a stale index.
+    items.unshift(item(99));
+    musicKit.changeToMediaAtIndex.mockImplementation(async index => {
+      Object.assign(musicKit, { nowPlayingItem: items[index] });
+      musicKitListeners.get("nowPlayingItemDidChange")?.({ item: items[index] });
+    });
+    await window.__sidra!.goTo(selected);
+    expect(musicKit.changeToMediaAtIndex).toHaveBeenCalledExactlyOnceWith(2);
+    expect(musicKit.seekToTime).toHaveBeenCalledExactlyOnceWith(0);
+    expect(musicKit.play).toHaveBeenCalledOnce();
+    expect(musicKit.seekToTime.mock.invocationCallOrder[0]).toBeLessThan(musicKit.play.mock.invocationCallOrder[0]);
+    expect(musicKit.setQueue).not.toHaveBeenCalled();
+    expect(latest(bridgeSend).currentOccurrenceId).toBe(selected);
+  });
+
+  it("restarts an already current occurrence without queue navigation", async () => {
+    const current = item(0);
+    const { window, musicKit, bridgeSend } = createHarness({ musicKitOverrides: {
+      queue: { items: [current], position: 0 }, nowPlayingItem: current,
+    } });
+    await window.__sidra!.goTo(latest(bridgeSend).currentOccurrenceId);
+    expect(musicKit.changeToMediaAtIndex).not.toHaveBeenCalled();
+    expect(musicKit.seekToTime).toHaveBeenCalledWith(0);
+    expect(musicKit.play).toHaveBeenCalledOnce();
+  });
+
+  it("rewinds an ordinary item even while duration is unknown", async () => {
+    const current = { id: "unknown-length", attributes: { name: "Track" } };
+    const { window, musicKit, bridgeSend } = createHarness({ musicKitOverrides: {
+      queue: { items: [current], position: 0 }, nowPlayingItem: current,
+    } });
+    await window.__sidra!.goTo(latest(bridgeSend).currentOccurrenceId);
+    expect(musicKit.seekToTime).toHaveBeenCalledWith(0);
+  });
+
+  it("does not rewind an unbounded radio station", async () => {
+    const current = { id: "radio", attributes: { playParams: { kind: "radioStation" } } };
+    const { window, musicKit, bridgeSend } = createHarness({ musicKitOverrides: {
+      queue: { items: [current], position: 0 }, nowPlayingItem: current,
+    } });
+    await window.__sidra!.goTo(latest(bridgeSend).currentOccurrenceId);
+    expect(musicKit.seekToTime).not.toHaveBeenCalled();
+    expect(musicKit.play).toHaveBeenCalledOnce();
+  });
+
+  it("waits for Stop rewind before selecting an occurrence", async () => {
+    const current = item(0);
+    const { window, musicKit, bridgeSend } = createHarness({ musicKitOverrides: {
+      queue: { items: [current], position: 0 }, nowPlayingItem: current,
+    } });
+    let resolveSeek!: () => void;
+    musicKit.seekToTime.mockReturnValueOnce(new Promise<void>(resolve => { resolveSeek = resolve; }));
+    const stopped = window.__sidra!.stop(1);
+    await Promise.resolve();
+    const selected = window.__sidra!.goTo(latest(bridgeSend).currentOccurrenceId);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(musicKit.seekToTime).toHaveBeenCalledOnce();
+    expect(musicKit.play).not.toHaveBeenCalled();
+    resolveSeek();
+    await Promise.all([stopped, selected]);
+    expect(musicKit.seekToTime).toHaveBeenCalledTimes(2);
+    expect(musicKit.play).toHaveBeenCalledOnce();
+  });
+
+  it("does not play an occurrence removed during rewind", async () => {
+    const current = item(0), next = item(1);
+    const items = [current, next];
+    const { window, musicKit, bridgeSend } = createHarness({ musicKitOverrides: {
+      queue: { items, position: 0 }, nowPlayingItem: current,
+    } });
+    let resolveSeek!: () => void;
+    musicKit.seekToTime.mockReturnValueOnce(new Promise<void>(resolve => { resolveSeek = resolve; }));
+    const task = window.__sidra!.goTo(latest(bridgeSend).currentOccurrenceId);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    items.shift();
+    resolveSeek();
+    await task;
+    expect(musicKit.play).not.toHaveBeenCalled();
+  });
+
+  it("does not navigate stale, removed or malformed identities", async () => {
+    const items = [item(0), item(1)];
+    const { window, musicKit, bridgeSend } = createHarness({ musicKitOverrides: { queue: { items, position: 0 }, nowPlayingItem: items[0] } });
+    const removed = latest(bridgeSend).items[1].occurrenceId;
+    items.pop();
+    for (const id of [removed, "d1_i1_o999", "/unknown", null]) await window.__sidra!.goTo(id);
+    expect(musicKit.changeToMediaAtIndex).not.toHaveBeenCalled();
+    expect(musicKit.seekToTime).not.toHaveBeenCalled();
+    expect(musicKit.play).not.toHaveBeenCalled();
+    expect(musicKit.setQueue).not.toHaveBeenCalled();
+  });
+
+  it("waits for the exact occurrence after SDK navigation resolves", async () => {
+    const items = [item(0), item(1)];
+    const { window, musicKit, musicKitListeners, bridgeSend } = createHarness({ musicKitOverrides: { queue: { items, position: 0 }, nowPlayingItem: items[0] } });
+    const task = window.__sidra!.goTo(latest(bridgeSend).items[1].occurrenceId);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(musicKit.seekToTime).not.toHaveBeenCalled();
+    Object.assign(musicKit, { nowPlayingItem: items[1] });
+    musicKitListeners.get("nowPlayingItemDidChange")?.({ item: items[1] });
+    await task;
+    expect(musicKit.seekToTime).toHaveBeenCalledWith(0);
+  });
+
+  it.each(["pagehide", "pause", "stop", "next", "previous", "seek", "instance"])("cancels a pending selection on %s", async action => {
+    const items = [item(0), item(1)];
+    const harness = createHarness({ musicKitOverrides: { queue: { items, position: 0 }, nowPlayingItem: items[0] } });
+    const { window, musicKit, musicKitListeners } = harness;
+    const task = window.__sidra!.goTo(latest(harness.bridgeSend).items[1].occurrenceId);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    if (action === "pagehide") harness.globalRegistrations.find(entry => entry.type === "pagehide")?.listener({});
+    else if (action === "instance") { harness.replaceInstance(); harness.runMonitorCycles(1); }
+    else await window.__sidra![action](action === "stop" ? 1 : 0);
+    const seeksBeforeArrival = musicKit.seekToTime.mock.calls.length;
+    Object.assign(musicKit, { nowPlayingItem: items[1] });
+    musicKitListeners.get("nowPlayingItemDidChange")?.({ item: items[1] });
+    harness.runTimeouts();
+    await task;
+    expect(musicKit.seekToTime).toHaveBeenCalledTimes(seeksBeforeArrival);
+    expect(musicKit.play).not.toHaveBeenCalled();
+  });
+
+  it("bounds SDK navigation waits and cannot seek or play after a late completion", async () => {
+    const items = [item(0), item(1)];
+    const { window, musicKit, musicKitListeners, bridgeSend, runTimeouts } = createHarness({ musicKitOverrides: { queue: { items, position: 0 }, nowPlayingItem: items[0] } });
+    let resolveNavigation!: () => void;
+    musicKit.changeToMediaAtIndex.mockReturnValueOnce(new Promise(resolve => { resolveNavigation = resolve; }));
+    const task = window.__sidra!.goTo(latest(bridgeSend).items[1].occurrenceId);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    runTimeouts();
+    await task;
+    await window.__sidra!.openUri("https://music.apple.com/album/999");
+    expect(musicKit.setQueue).not.toHaveBeenCalled();
+    Object.assign(musicKit, { nowPlayingItem: items[1] });
+    musicKitListeners.get("nowPlayingItemDidChange")?.({ item: items[1] });
+    resolveNavigation();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(musicKit.seekToTime).not.toHaveBeenCalled();
+    expect(musicKit.play).not.toHaveBeenCalled();
+    await window.__sidra!.openUri("https://music.apple.com/album/1000");
+    expect(musicKit.setQueue).toHaveBeenCalledOnce();
+  });
+});
 
 describe("MusicKit OpenUri", () => {
   it.each(["music.apple.com", "classical.music.apple.com"])(
