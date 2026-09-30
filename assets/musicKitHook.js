@@ -516,13 +516,13 @@
         pendingStop = null;
         stopped = false;
       }
-      function cancelGoTo() {
+      function cancelGoTo(cancelArrival = false) {
         queueRequest += 1;
-        goToArrival?.cancel();
+        if (cancelArrival) goToArrival?.cancel();
       }
       resetStopForDocument = () => {
         resetStop();
-        cancelGoTo();
+        cancelGoTo(true);
       };
       function current(operationGeneration, pageGeneration) {
         return (
@@ -536,12 +536,16 @@
         if (!Number.isSafeInteger(requestId) || requestId <= 0)
           return Promise.resolve();
         cancelGoTo();
-        if (pendingStop) return pendingStop;
-        const operationGeneration = generation;
+        resumeGeneration += 1;
+        if (pendingStop) return pendingStop.task;
+        const intent = { generation, task: null };
         const pageGeneration = documentGeneration;
-        const task = Promise.resolve()
+        const task = queueTask
           .then(async () => {
-            if (!current(operationGeneration, pageGeneration)) return;
+            if (!documentActive || documentGeneration !== pageGeneration ||
+              window.__sidraHookedMk !== mk) return;
+            // A queue operation ahead of Stop can legitimately change the item.
+            intent.generation = generation;
             if (!stopped) {
               mk.pause();
               if (
@@ -565,27 +569,28 @@
                 }
               }
             }
-            if (!current(operationGeneration, pageGeneration)) return;
+            if (!current(intent.generation, pageGeneration)) return;
             stopped = true;
             sendToMain("playbackStopped", { requestId, success: true });
           })
           .catch(() => {
             console.warn("[Sidra] failed to stop playback");
-            if (current(operationGeneration, pageGeneration)) {
+            if (current(intent.generation, pageGeneration)) {
               sendToMain("playbackStopped", { requestId, success: false });
             }
           })
           .finally(() => {
-            if (pendingStop === task) pendingStop = null;
+            if (pendingStop === intent) pendingStop = null;
           });
-        pendingStop = task;
+        intent.task = task;
+        pendingStop = intent;
+        queueTask = task;
         return task;
       }
-      function resume(toggle) {
-        const operationGeneration = generation;
+      function resume(toggle, afterStop = pendingStop) {
+        const operationGeneration = afterStop?.generation ?? generation;
         const resumeToken = resumeGeneration;
         const pageGeneration = documentGeneration;
-        const afterStop = pendingStop;
         const run = () => {
           if (
             resumeToken !== resumeGeneration ||
@@ -598,7 +603,7 @@
         };
         try {
           return (
-            afterStop ? afterStop.then(run) : Promise.resolve(run())
+            afterStop ? afterStop.task.then(run) : Promise.resolve(run())
           ).catch(() => {
             console.warn("[Sidra] failed to resume playback");
           });
@@ -606,6 +611,30 @@
           console.warn("[Sidra] failed to resume playback");
           return Promise.resolve();
         }
+      }
+
+      // Cancellation suppresses GoTo's continuation, not the SDK call already
+      // running. Keep later controls behind its real settlement, even after timeout.
+      function runPlaybackCommand(operation) {
+        cancelGoTo();
+        const pageGeneration = documentGeneration;
+        queueTask = queueTask.then(() => {
+          if (!documentActive || documentGeneration !== pageGeneration ||
+            window.__sidraHookedMk !== mk) return;
+          return operation();
+        }).catch(() => {
+          console.warn("[Sidra] failed to control playback");
+        });
+        return queueTask;
+      }
+
+      function resumeAfterQueue(toggle) {
+        const resumeToken = resumeGeneration;
+        const afterStop = pendingStop;
+        return runPlaybackCommand(() => {
+          if (resumeToken !== resumeGeneration) return;
+          return resume(toggle, afterStop);
+        });
       }
 
       // Queue replacement and cursor navigation share one SDK operation chain.
@@ -621,7 +650,7 @@
         queueTask = queueTask
           .then(async () => {
             if (!valid()) return;
-            if (pendingStop) await pendingStop;
+            if (pendingStop) await pendingStop.task;
             if (!valid()) return;
             resetStop();
             await operation(valid);
@@ -634,7 +663,7 @@
             new Promise((_, reject) => {
               timeout = setTimeout(() => {
                 if (!blockedQueue) {
-                  cancelGoTo();
+                  cancelGoTo(true);
                   blockedQueue = queueTask;
                   // The SDK still owns the queue after the caller stops waiting.
                   blockedQueue.then(() => { blockedQueue = null; });
@@ -655,6 +684,7 @@
             window.__sidraHookedMk !== mk) return;
           cancelGoTo();
           await runQueueCommand(async (valid) => {
+            const pageGeneration = documentGeneration;
             const items = queueItems();
             const matches = items
               .map((item, index) => occurrenceId(item) === id ? index : -1)
@@ -674,7 +704,8 @@
                 goToArrival = {
                   cancel: () => finish(false),
                   check: () => {
-                    if (!valid() || !queueItems().includes(target)) finish(false);
+                    if (!documentActive || pageGeneration !== documentGeneration ||
+                      window.__sidraHookedMk !== mk || !queueItems().includes(target)) finish(false);
                     else if (mk.nowPlayingItem === target) finish(true);
                   },
                 };
@@ -746,32 +777,16 @@
             console.warn("[Sidra] failed to open requested media");
           }
         },
-        play: () => {
-          cancelGoTo();
-          return resume(false);
-        },
+        play: () => resumeAfterQueue(false),
         pause: () => {
-          cancelGoTo();
           resumeGeneration += 1;
-          return mk.pause();
+          return runPlaybackCommand(() => mk.pause());
         },
         stop,
-        playPause: () => {
-          cancelGoTo();
-          return resume(true);
-        },
-        next: () => {
-          cancelGoTo();
-          return mk.skipToNextItem();
-        },
-        previous: () => {
-          cancelGoTo();
-          return mk.skipToPreviousItem();
-        },
-        seek: (secs) => {
-          cancelGoTo();
-          return mk.seekToTime(secs);
-        },
+        playPause: () => resumeAfterQueue(true),
+        next: () => runPlaybackCommand(() => mk.skipToNextItem()),
+        previous: () => runPlaybackCommand(() => mk.skipToPreviousItem()),
+        seek: (secs) => runPlaybackCommand(() => mk.seekToTime(secs)),
         setVolume: (v) => {
           mk.volume = v;
         },
